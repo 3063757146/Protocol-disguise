@@ -1,0 +1,6 @@
+{
+	"serverIP": "127.0.0.1",
+	"serverPort": 443,
+	"localPort": 8000,
+	"clientLocalPort": 80
+}
