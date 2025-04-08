@@ -1,4 +1,6 @@
 {
     "dns_server": "127.0.0.1:53",
-    "target_server": "127.0.0.1:8001"
+    "target_server": "127.0.0.1:8001",
+    "aes_key": "1234567890abcdef"   ,
+    "proxy_port": ":8080"
 }

@@ -1,5 +1,6 @@
 {
     "smtp_port": ":25",
     "proxy_port": ":8080",
-    "target_addr": "127.0.0.1:8000"
+    "target_addr": "127.0.0.1:8000",
+    "aes_key": "1234567890abcdef"   
 }

@@ -3,10 +3,13 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"strings"
@@ -17,7 +20,10 @@ type Config struct {
 	POP3Port   string `json:"pop3_port"`
 	ProxyPort  string `json:"proxy_port"`
 	TargetAddr string `json:"target_addr"`
+	AESKey     string `json:"aes_key"`
 }
+
+var aesKey []byte
 
 func main() {
 	// 从配置文件加载配置
@@ -25,6 +31,10 @@ func main() {
 	if err != nil {
 		fmt.Printf("加载配置文件失败: %v\n", err)
 		os.Exit(1)
+	}
+	aesKey = []byte(config.AESKey)
+	if len(aesKey) != 16 {
+		log.Fatalf("AES 密钥长度必须是16字节")
 	}
 
 	// 启动POP3服务端
@@ -90,11 +100,11 @@ func loadConfig(filename string) (Config, error) {
 }
 
 // POP3服务端处理逻辑
-func handlePOP3Connection(conn net.Conn, TargetAddr string) {
+func handlePOP3Connection(conn net.Conn, targetAddr string) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
 
-	// POP3协议阶段
+	// POP3 协议问候
 	sendPOP3Response(conn, "+OK POP3 proxy ready")
 
 	// 认证阶段
@@ -133,9 +143,16 @@ func handlePOP3Connection(conn net.Conn, TargetAddr string) {
 
 		case strings.HasPrefix(line, "RETR "):
 			// 从代理获取实际数据
-			proxyData := fetchFromTarget(TargetAddr)
-
-			encoded := base64.StdEncoding.EncodeToString(proxyData)
+			proxyData := fetchFromTarget(targetAddr)
+			// 先对原始数据进行 AES 加密
+			encrypted, err := aesEncrypt(proxyData)
+			if err != nil {
+				fmt.Printf("Encryption error: %v\n", err)
+				return
+			}
+			// 再进行 Base64 编码
+			encoded := base64.StdEncoding.EncodeToString(encrypted)
+			// fmt.Println(encoded)
 			if _, err := conn.Write([]byte(fmt.Sprintf("+OK %d bytes", len(encoded)))); err != nil {
 				fmt.Printf("Write error: %v\n", err)
 				return
@@ -175,7 +192,7 @@ func fetchFromTarget(target string) []byte {
 	return buf.Bytes()
 }
 
-// 本地代理处理
+// 本地代理处理，从 POP3 服务端获取数据后，进行 Base64 解码，再 AES 解密后转发给客户端
 func handleProxyConnection(localConn net.Conn, targetAddr string, POP3Port string) {
 	defer localConn.Close()
 
@@ -245,19 +262,27 @@ func handleProxyConnection(localConn net.Conn, targetAddr string, POP3Port strin
 		}
 	}
 
+	// Base64 解码
 	decoded, err := base64.StdEncoding.DecodeString(encodedContent)
 	if err != nil {
 		fmt.Printf("Decode error: %v\n", err)
 		return
 	}
 
-	if _, err := localConn.Write(decoded); err != nil {
+	// AES 解密
+	decrypted, err := aesDecrypt(decoded)
+	if err != nil {
+		fmt.Printf("Decrypt error: %v\n", err)
+		return
+	}
+
+	if _, err := localConn.Write(decrypted); err != nil {
 		fmt.Printf("Write error: %v\n", err)
 		return
 	}
 }
 
-// 测试客户端
+// 测试客户端，用于展示从代理获取的数据
 func testPOP3Client(proxyPort string) {
 	conn, err := net.Dial("tcp", proxyPort)
 	if err != nil {
@@ -275,13 +300,14 @@ func testPOP3Client(proxyPort string) {
 	fmt.Printf("----------(Test Client) Received:\n%s\n", buf[:n])
 }
 
-// 工具函数
+// 工具函数：发送 POP3 响应
 func sendPOP3Response(conn net.Conn, msg string) {
 	if _, err := conn.Write([]byte(msg + "\r\n")); err != nil {
 		fmt.Printf("Write error: %v\n", err)
 	}
 }
 
+// 工具函数：读取 POP3 响应
 func readPOP3Response(reader *bufio.Reader) string {
 	resp, err := reader.ReadString('\n')
 	if err != nil {
@@ -289,4 +315,37 @@ func readPOP3Response(reader *bufio.Reader) string {
 		return ""
 	}
 	return strings.TrimSpace(resp)
+}
+
+// AES 加密函数：CBC 模式，使用固定 IV（取自密钥前16字节）
+func aesEncrypt(plainText []byte) ([]byte, error) {
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, err
+	}
+	padding := aes.BlockSize - len(plainText)%aes.BlockSize
+	padtext := bytes.Repeat([]byte{byte(padding)}, padding)
+	plainText = append(plainText, padtext...)
+
+	iv := aesKey[:aes.BlockSize]
+	blockMode := cipher.NewCBCEncrypter(block, iv)
+	cipherText := make([]byte, len(plainText))
+	blockMode.CryptBlocks(cipherText, plainText)
+	return cipherText, nil
+}
+
+// AES 解密函数：CBC 模式，使用固定 IV
+func aesDecrypt(cipherText []byte) ([]byte, error) {
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, err
+	}
+	iv := aesKey[:aes.BlockSize]
+	blockMode := cipher.NewCBCDecrypter(block, iv)
+	plainText := make([]byte, len(cipherText))
+	blockMode.CryptBlocks(plainText, cipherText)
+
+	length := len(plainText)
+	unpadding := int(plainText[length-1])
+	return plainText[:(length - unpadding)], nil
 }

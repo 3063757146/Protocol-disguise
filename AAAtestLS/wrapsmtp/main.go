@@ -2,6 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -16,6 +19,7 @@ type Config struct {
 	SMTPPort   string `json:"smtp_port"`
 	ProxyPort  string `json:"proxy_port"`
 	TargetAddr string `json:"target_addr"`
+	AESKey     string `json:"aes_key"` // AES加密密钥
 }
 
 func main() {
@@ -41,7 +45,7 @@ func main() {
 				fmt.Printf("Accept error: %v\n", err)
 				continue
 			}
-			go handleServerConn(conn)
+			go handleServerConn(conn, config)
 		}
 	}()
 
@@ -59,7 +63,7 @@ func main() {
 	// 启动一个定时器，5秒后自动关闭程序
 	go func() {
 		time.Sleep(5 * time.Second)
-		fmt.Println("为了不影响后续演示 ，隧道将在5秒后自动关闭")
+		fmt.Println("为了不影响后续演示，隧道将在5秒后自动关闭")
 		os.Exit(0)
 	}()
 
@@ -69,7 +73,7 @@ func main() {
 			fmt.Printf("Proxy accept error: %v\n", err)
 			continue
 		}
-		go handleProxyConn(conn, config.TargetAddr, config.SMTPPort)
+		go handleProxyConn(conn, config)
 	}
 }
 
@@ -89,7 +93,7 @@ func loadConfig(filename string) (Config, error) {
 }
 
 // 服务端处理逻辑
-func handleServerConn(conn net.Conn) {
+func handleServerConn(conn net.Conn, config Config) {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
@@ -111,20 +115,29 @@ func handleServerConn(conn net.Conn) {
 	data := readSMTPData(reader)
 	decoded, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(data, "\r\n", ""))
 	if err != nil {
-		fmt.Printf("Decode error: %v\n", err)
+		fmt.Printf("Base64 Decode error: %v\n", err)
+		sendSMTPResponse(conn, "500 Invalid base64 format")
 		return
 	}
 
-	fmt.Printf("Decoded data: %s\n", string(decoded))
+	// AES解密
+	decrypted, err := aesDecrypt(decoded, []byte(config.AESKey))
+	if err != nil {
+		fmt.Printf("AES Decrypt error: %v\n", err)
+		sendSMTPResponse(conn, "500 Decryption failed")
+		return
+	}
+
+	// fmt.Printf("Decrypted data: %s\n", string(decrypted))
 
 	// 解析目标信息
-	payload := strings.SplitN(string(decoded), "|", 3)
+	payload := strings.SplitN(string(decrypted), "|", 3)
 	if len(payload) != 3 {
 		fmt.Printf("Invalid payload format: %#v\n", payload)
 		sendSMTPResponse(conn, "500 Invalid payload format")
 		return
 	}
-	fmt.Printf("Parsed payload: host=%s, port=%s, data=%s\n", payload[0], payload[1], payload[2])
+	// fmt.Printf("Parsed payload: host=%s, port=%s, data=%s\n", payload[0], payload[1], payload[2])
 
 	// 正确拼接目标地址
 	targetAddr := fmt.Sprintf("%s:%s", payload[0], payload[1])
@@ -139,24 +152,17 @@ func handleServerConn(conn net.Conn) {
 	}
 	defer targetConn.Close()
 
-	// 构造HTTP请求
-	request := "GET / HTTP/1.1\r\nHost: " + targetAddr + "\r\nConnection: close\r\n\r\n"
-	fmt.Printf("-----------测试HTTP请求 : %s\n", request)
-	// fmt.Printf("Sending HTTP request: %s\n", request)
-
-	// 转发HTTP请求
-	if _, err := targetConn.Write([]byte(request)); err != nil {
+	// 转发数据
+	if _, err := targetConn.Write([]byte(payload[2])); err != nil {
 		fmt.Printf("Forward error: %v\n", err)
 		sendSMTPResponse(conn, "500 Forward error")
 		return
 	}
 
-	// 读取HTTP响应
+	// 读取响应
 	resp := make([]byte, 4096)
-	// fmt.Print("----------server begin read\n")
 	targetConn.SetReadDeadline(time.Now().Add(5 * time.Second)) // 设置读取超时
 	n, err := targetConn.Read(resp)
-	// fmt.Print("----------server end read\n")
 	if err != nil {
 		if err.Error() == "read tcp "+targetAddr+": i/o timeout" {
 			fmt.Printf("Read response timeout\n")
@@ -166,18 +172,27 @@ func handleServerConn(conn net.Conn) {
 		sendSMTPResponse(conn, "500 Read error")
 		return
 	}
-	// fmt.Printf("[[[[[Target server response: %s]]]]]\n", string(resp[:n]))
 
-	// 封装HTTP响应
+	// 封装响应
 	encodedResp := base64.StdEncoding.EncodeToString(resp[:n])
-	sendSMTPResponse(conn, "250 OK\r\n"+encodedResp+"\r\n.\r\n")
+
+	// AES加密
+	encrypted, err := aesEncrypt([]byte(encodedResp), []byte(config.AESKey))
+	if err != nil {
+		fmt.Printf("AES Encrypt error: %v\n", err)
+		sendSMTPResponse(conn, "500 Encryption failed")
+		return
+	}
+
+	encodedEncrypted := base64.StdEncoding.EncodeToString(encrypted)
+	sendSMTPResponse(conn, "250 OK\r\n"+encodedEncrypted+"\r\n.\r\n")
 }
 
 // 代理客户端处理逻辑
-func handleProxyConn(localConn net.Conn, targetAddr string, SMTP_PORT string) {
+func handleProxyConn(localConn net.Conn, config Config) {
 	defer localConn.Close()
 
-	smtpConn, err := net.Dial("tcp", SMTP_PORT)
+	smtpConn, err := net.Dial("tcp", config.SMTPPort)
 	if err != nil {
 		fmt.Printf("SMTP connection failed: %v\n", err)
 		return
@@ -234,14 +249,24 @@ func handleProxyConn(localConn net.Conn, targetAddr string, SMTP_PORT string) {
 	}
 
 	// 构造payload
-	host, port, err := net.SplitHostPort(targetAddr)
+	host, port, err := net.SplitHostPort(config.TargetAddr)
 	if err != nil {
 		fmt.Printf("Split target address error: %v\n", err)
 		return
 	}
 	payload := fmt.Sprintf("%s|%s|%s", host, port, string(buf[:n]))
-	encoded := base64.StdEncoding.EncodeToString([]byte(payload))
-	fmt.Printf("Encoded payload: %s\n", encoded)
+	fmt.Printf("Original payload: %s\n", payload)
+
+	// AES加密
+	encrypted, err := aesEncrypt([]byte(payload), []byte(config.AESKey))
+	if err != nil {
+		fmt.Printf("AES Encrypt error: %v\n", err)
+		return
+	}
+
+	// Base64编码
+	encoded := base64.StdEncoding.EncodeToString(encrypted)
+	// fmt.Printf("Encoded payload: %s\n", encoded)
 	// 发送数据
 	fmt.Fprintf(smtpConn, "%s\r\n.\r\n", encoded)
 
@@ -256,7 +281,20 @@ func handleProxyConn(localConn net.Conn, targetAddr string, SMTP_PORT string) {
 		// 检查并清理数据
 		cleanedData := strings.TrimSpace(parts[2])
 		if decoded, err := base64.StdEncoding.DecodeString(cleanedData); err == nil {
-			localConn.Write(decoded)
+			// AES解密
+			decrypted, err := aesDecrypt(decoded, []byte(config.AESKey))
+			if err != nil {
+				fmt.Printf("AES Decrypt error: %v\n", err)
+				return
+			}
+			decodedData, err := base64.StdEncoding.DecodeString(string(decrypted))
+			if err != nil {
+				fmt.Println("Base64 decode failed:", err)
+				return
+			}
+
+			// 将解密后的数据发送回测试客户端
+			localConn.Write(decodedData)
 		} else {
 			fmt.Printf("Decode response error: %v\n", err)
 			// 打印原始数据和清理后的数据以便调试
@@ -264,6 +302,37 @@ func handleProxyConn(localConn net.Conn, targetAddr string, SMTP_PORT string) {
 			fmt.Printf("Cleaned data: %s\n", cleanedData)
 		}
 	}
+}
+
+func aesEncrypt(plainText []byte, aesKey []byte) ([]byte, error) {
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, err
+	}
+	padding := aes.BlockSize - len(plainText)%aes.BlockSize
+	padtext := bytes.Repeat([]byte{byte(padding)}, padding)
+	plainText = append(plainText, padtext...)
+
+	iv := aesKey[:aes.BlockSize]
+	blockMode := cipher.NewCBCEncrypter(block, iv)
+	cipherText := make([]byte, len(plainText))
+	blockMode.CryptBlocks(cipherText, plainText)
+	return cipherText, nil
+}
+
+func aesDecrypt(cipherText []byte, aesKey []byte) ([]byte, error) {
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, err
+	}
+	iv := aesKey[:aes.BlockSize]
+	blockMode := cipher.NewCBCDecrypter(block, iv)
+	plainText := make([]byte, len(cipherText))
+	blockMode.CryptBlocks(plainText, cipherText)
+
+	length := len(plainText)
+	unpadding := int(plainText[length-1])
+	return plainText[:(length - unpadding)], nil
 }
 
 // 测试客户端
@@ -275,16 +344,19 @@ func testClient(proxyPort, targetAddr string) {
 	}
 	defer conn.Close()
 
-	testData := "Hello, target server "
+	// 构造HTTP请求
+	httpRequest := "GET / HTTP/1.1\r\nHost: " + targetAddr + "\r\nConnection: close\r\n\r\n"
+	fmt.Printf("Sending HTTP request: %s\n", httpRequest)
 
-	// 发送测试数据
-	_, err = conn.Write([]byte(testData))
+	// 发送HTTP请求
+	_, err = conn.Write([]byte(httpRequest))
 	if err != nil {
 		fmt.Printf("Test client write failed: %v\n", err)
 		return
 	}
 
 	// 使用通道来等待响应
+
 	responseChan := make(chan []byte)
 	go func() {
 		buf := make([]byte, 1024)

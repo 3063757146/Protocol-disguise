@@ -1,273 +1,347 @@
 package main
 
 import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
-	"time"
-
-	"encoding/json"
 	"os"
+	"time"
 
 	"github.com/miekg/dns"
 )
 
 type Config struct {
-	DNSServer    string `json:"dns_server"`
-	TargetServer string `json:"target_server"`
+	DNSServer    string `json:"dns_server"`    // 服务端监听的DNS端口
+	ProxyPort    string `json:"proxy_port"`    // 本地代理监听的端口
+	TargetServer string `json:"target_server"` // 目标服务器地址
+	AESKey       string `json:"aes_key"`       // AES加密密钥
 }
 
+var aesKey []byte
+
 func main() {
-	// 从配置文件加载配置
 	fmt.Println("开始------------")
+
 	config, err := loadConfig("config.json")
 	if err != nil {
 		log.Fatalf("加载配置文件失败: %v", err)
 	}
+	aesKey = []byte(config.AESKey)
+	if len(aesKey) != 16 {
+		log.Fatalf("AES 密钥长度必须是16字节")
+	}
 
-	// 使用 goroutine 启动 DNS 服务器
 	go startDNSServer(config.DNSServer, config.TargetServer)
 
-	// 等待服务器启动
 	time.Sleep(time.Second)
 
-	// 启动 DNS 客户端
-	startDNSClient(config.DNSServer)
+	go startProxyServer(config.ProxyPort, config.DNSServer)
 
-	// 等待客户端完成
+	time.Sleep(time.Second)
+
+	startTestClient(config.ProxyPort)
+
 	time.Sleep(time.Second * 2)
 }
 
-// 从配置文件加载配置
 func loadConfig(filename string) (Config, error) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		return Config{}, err
 	}
-
 	var config Config
 	err = json.Unmarshal(data, &config)
-	if err != nil {
-		return Config{}, err
-	}
-
-	return config, nil
+	return config, err
 }
 
-// 启动 DNS 服务器
+// 本地代理客户端处理逻辑
+func startProxyServer(proxyPort, dnsServerAddr string) {
+	listener, err := net.Listen("tcp", proxyPort)
+	if err != nil {
+		log.Fatalf("本地代理启动失败: %v", err)
+	}
+	defer listener.Close()
+	log.Printf("本地代理监听在 %s", proxyPort)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Printf("接受连接失败: %v", err)
+			continue
+		}
+		go handleProxyConn(conn, dnsServerAddr)
+	}
+}
+
+func handleProxyConn(localConn net.Conn, dnsServerAddr string) {
+	defer localConn.Close()
+
+	// 读取HTTP请求
+	buf := make([]byte, 1024)
+	n, err := localConn.Read(buf)
+	if err != nil {
+		log.Printf("读取HTTP请求失败: %v", err)
+		return
+	}
+
+	// 构造HTTP请求数据
+	httpRequest := string(buf[:n])
+	fmt.Printf("接收到HTTP请求: %s\n", httpRequest)
+
+	// 使用AES加密和Base64编码
+	encrypted, err := aesEncrypt([]byte(httpRequest))
+	if err != nil {
+		log.Printf("AES加密失败: %v", err)
+		return
+	}
+
+	// 封装成DNS请求
+	dnsMsg, err := encapsulateDataToDNSQuery(encrypted)
+	if err != nil {
+		log.Printf("封装DNS请求失败: %v", err)
+		return
+	}
+
+	// 发送DNS请求
+	conn, err := net.Dial("udp", dnsServerAddr)
+	if err != nil {
+		log.Printf("连接DNS服务器失败: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	query, err := dnsMsg.Pack()
+	if err != nil {
+		log.Printf("打包DNS请求失败: %v", err)
+		return
+	}
+
+	_, err = conn.Write(query)
+	if err != nil {
+		log.Printf("发送DNS请求失败: %v", err)
+		return
+	}
+
+	// 接收DNS响应
+	buf = make([]byte, 1024)
+	n, err = conn.Read(buf)
+	if err != nil {
+		log.Printf("接收DNS响应失败: %v", err)
+		return
+	}
+
+	response := &dns.Msg{}
+	err = response.Unpack(buf[:n])
+	if err != nil {
+		log.Printf("解包DNS响应失败: %v", err)
+		return
+	}
+
+	// 提取响应数据
+	responseData, err := extractDataFromDNSQuery(response)
+	if err != nil {
+		log.Printf("解析DNS响应失败: %v", err)
+		return
+	}
+
+	// 解密响应数据
+	decrypted, err := aesDecrypt(responseData)
+	if err != nil {
+		log.Printf("AES解密失败: %v", err)
+		return
+	}
+
+	// 返回响应给测试客户端
+	localConn.Write(decrypted)
+}
+
+// 服务端处理逻辑
 func startDNSServer(dnsServerAddr, targetServer string) {
-	// 创建 UDP 连接
 	addr, err := net.ResolveUDPAddr("udp", dnsServerAddr)
 	if err != nil {
-		log.Fatalf("Error resolving DNS server address: %v", err)
+		log.Fatalf("解析DNS服务器地址失败: %v", err)
 	}
 
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		log.Fatalf("Error starting DNS server: %v", err)
+		log.Fatalf("启动DNS服务器失败: %v", err)
 	}
 	defer conn.Close()
 
-	log.Printf("DNS server started on %s", dnsServerAddr)
+	log.Printf("DNS服务器启动在 %s", dnsServerAddr)
 
 	for {
-		// 创建缓冲区
 		buf := make([]byte, 1024)
-		// 接收 DNS 请求
 		n, addr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("Error receiving DNS request: %v", err)
+			log.Printf("接收DNS请求失败: %v", err)
 			continue
 		}
 
-		// 创建新的 DNS 消息
 		request := &dns.Msg{}
 		if err := request.Unpack(buf[:n]); err != nil {
-			log.Printf("Error unpacking DNS request: %v", err)
+			log.Printf("解包DNS请求失败: %v", err)
 			continue
 		}
 
-		// 处理 DNS 请求
 		response, err := handleDNSRequest(request, targetServer)
 		if err != nil {
-			log.Printf("Error handling DNS request: %v", err)
+			log.Printf("处理DNS请求失败: %v", err)
 			continue
 		}
 
-		// 打包 DNS 响应
 		resp, err := response.Pack()
 		if err != nil {
-			log.Printf("Error packing DNS response: %v", err)
+			log.Printf("打包DNS响应失败: %v", err)
 			continue
 		}
 
-		// 发送 DNS 响应
 		if _, err := conn.WriteToUDP(resp, addr); err != nil {
-			log.Printf("Error sending DNS response: %v", err)
+			log.Printf("发送DNS响应失败: %v", err)
 		}
 	}
 }
 
-// / 处理 DNS 请求
 func handleDNSRequest(request *dns.Msg, targetServer string) (*dns.Msg, error) {
-	// 判断是否为封装的数据
 	data, err := extractDataFromDNSQuery(request)
 	if err != nil {
-		log.Printf("Error extracting data from DNS query: %v", err)
+		log.Printf("提取DNS数据失败: %v", err)
 		return nil, err
 	}
 
 	if data != nil {
-		// log.Printf("Received encapsulated data: %s", string(data))
-
-		// 将数据发送到 target_server 并接收响应
-		responseData, err := forwardDataToTargetServer(data, targetServer)
+		decrypted, err := aesDecrypt(data)
 		if err != nil {
-			log.Printf("Error forwarding data to target server: %v", err)
 			return nil, err
 		}
 
-		// 构造响应消息
-		responseMsg, err := encapsulateDataToDNSQuery(responseData)
+		responseData, err := forwardDataToTargetServer(decrypted, targetServer)
 		if err != nil {
-			log.Printf("Error encapsulating response data: %v", err)
+			return nil, err
+		}
+
+		encrypted, err := aesEncrypt(responseData)
+		if err != nil {
+			return nil, err
+		}
+
+		responseMsg, err := encapsulateDataToDNSQuery(encrypted)
+		if err != nil {
 			return nil, err
 		}
 		responseMsg.SetReply(request)
 		return responseMsg, nil
 	}
 
-	// 若不是封装的数据，按正常 DNS 流程处理
-	response := &dns.Msg{
-		MsgHdr: dns.MsgHdr{
-			Id:                 request.Id,
-			Response:           true,
-			Opcode:             request.Opcode,
-			Authoritative:      false,
-			Truncated:          false,
-			RecursionDesired:   request.RecursionDesired,
-			RecursionAvailable: true,
-			AuthenticatedData:  false,
-			CheckingDisabled:   false,
-			Rcode:              dns.RcodeSuccess,
-		},
-		Question: request.Question,
-	}
-
+	response := &dns.Msg{}
+	response.SetReply(request)
 	return response, nil
 }
 
-// 将数据转发到 target_server 并接收响应
 func forwardDataToTargetServer(data []byte, targetServer string) ([]byte, error) {
-	// 解析 target_server 地址
 	addr, err := net.ResolveUDPAddr("udp", targetServer)
 	if err != nil {
 		return nil, err
 	}
 
-	// 创建 UDP 连接
 	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
 
-	// 发送数据
 	_, err = conn.Write(data)
 	if err != nil {
 		return nil, err
 	}
 
-	// 设置读取超时
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second)) // 5秒超时
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
-	// 接收响应数据
 	buf := make([]byte, 1024)
 	n, err := conn.Read(buf)
 	if err != nil {
-		if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
-			return nil, fmt.Errorf("timeout while waiting for response from target server")
-		}
 		return nil, err
 	}
-
 	return buf[:n], nil
 }
 
-// 启动 DNS 客户端
-func startDNSClient(dnsServerAddr string) {
-	// 模拟其他协议的数据
+// 测试客户端
+func startTestClient(proxyPort string) {
 	httpRequest := "GET / HTTP/1.1\r\nHost: example.com\r\nUser-Agent: Go-http-client/1.1\r\n\r\n"
-	fmt.Printf("-------------正在测试通过dns隧道向目标服务器发送：: %s\n", httpRequest)
-	otherProtocolData := []byte(httpRequest)
+	fmt.Printf("正在测试发送数据: %s\n", httpRequest)
 
-	// 封装数据到 DNS 查询
-	dnsMsg, err := encapsulateDataToDNSQuery(otherProtocolData)
+	conn, err := net.Dial("tcp", proxyPort)
 	if err != nil {
-		log.Fatalf("Error encapsulating data: %v", err)
-	}
-
-	// 创建 UDP 连接
-	conn, err := net.Dial("udp", dnsServerAddr) // 连接到指定的 DNS 服务器
-	if err != nil {
-		log.Fatalf("Error connecting to DNS server: %v", err)
+		log.Fatalf("连接本地代理失败: %v", err)
 	}
 	defer conn.Close()
 
-	// 打包 DNS 查询消息
-	query, err := dnsMsg.Pack()
+	_, err = conn.Write([]byte(httpRequest))
 	if err != nil {
-		log.Fatalf("Error packing DNS query: %v", err)
+		log.Fatalf("发送HTTP请求失败: %v", err)
 	}
 
-	// 发送 DNS 查询
-	_, err = conn.Write(query)
-	if err != nil {
-		log.Fatalf("Error sending DNS query: %v", err)
-	}
-
-	// 接收 DNS 响应
 	buf := make([]byte, 1024)
 	n, err := conn.Read(buf)
 	if err != nil {
-		log.Fatalf("Error receiving DNS response: %v", err)
+		log.Fatalf("接收响应失败: %v", err)
 	}
 
-	// 解包 DNS 响应
-	response := &dns.Msg{}
-	err = response.Unpack(buf[:n])
-	if err != nil {
-		log.Fatalf("Error unpacking DNS response: %v", err)
-	}
-
-	// 解析响应中的封装数据
-	responseData, err := extractDataFromDNSQuery(response)
-	if err != nil {
-		log.Fatalf("Error extracting data from DNS response: %v", err)
-	}
-
-	fmt.Printf("收到返回数据Received response data: %s\n", string(responseData))
+	fmt.Printf("收到目标服务器返回数据: %s\n", string(buf[:n]))
 }
 
-// 封装其他协议数据到 DNS 查询
+// 加密和解密函数
+func aesEncrypt(plainText []byte) ([]byte, error) {
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, err
+	}
+	padding := aes.BlockSize - len(plainText)%aes.BlockSize
+	padtext := bytes.Repeat([]byte{byte(padding)}, padding)
+	plainText = append(plainText, padtext...)
+
+	iv := aesKey[:aes.BlockSize]
+	blockMode := cipher.NewCBCEncrypter(block, iv)
+	cipherText := make([]byte, len(plainText))
+	blockMode.CryptBlocks(cipherText, plainText)
+	return cipherText, nil
+}
+
+func aesDecrypt(cipherText []byte) ([]byte, error) {
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, err
+	}
+	iv := aesKey[:aes.BlockSize]
+	blockMode := cipher.NewCBCDecrypter(block, iv)
+	plainText := make([]byte, len(cipherText))
+	blockMode.CryptBlocks(plainText, cipherText)
+
+	length := len(plainText)
+	unpadding := int(plainText[length-1])
+	return plainText[:(length - unpadding)], nil
+}
+
+// DNS封装和解封装函数
 func encapsulateDataToDNSQuery(data []byte) (*dns.Msg, error) {
 	encodedData := base64.StdEncoding.EncodeToString(data)
-	// fmt.Printf("Encoded data: %s\n", data)
-	// fmt.Printf("Encapsulating data: %s\n", encodedData)
 
-	// 使用TXT记录来封装数据
 	msg := new(dns.Msg)
 	msg.Id = dns.Id()
 	msg.RecursionDesired = true
-	msg.Question = make([]dns.Question, 1)
-	msg.Question[0] = dns.Question{
-		Name:   "encapsulated.example.com.",
-		Qtype:  dns.TypeTXT,
-		Qclass: dns.ClassINET,
+	msg.Question = []dns.Question{
+		{
+			Name:   "encapsulated.example.com.",
+			Qtype:  dns.TypeTXT,
+			Qclass: dns.ClassINET,
+		},
 	}
 
-	// 添加TXT记录
 	txtRecord := &dns.TXT{
 		Hdr: dns.RR_Header{
 			Name:   "encapsulated.example.com.",
@@ -277,20 +351,22 @@ func encapsulateDataToDNSQuery(data []byte) (*dns.Msg, error) {
 		},
 		Txt: []string{encodedData},
 	}
-	msg.Answer = append(msg.Answer, txtRecord)
 
+	msg.Answer = append(msg.Answer, txtRecord)
 	return msg, nil
 }
 
-// 从 DNS 查询中解析封装的数据
 func extractDataFromDNSQuery(msg *dns.Msg) ([]byte, error) {
 	for _, answer := range msg.Answer {
 		if txt, ok := answer.(*dns.TXT); ok {
 			if len(txt.Txt) > 0 {
-				return base64.StdEncoding.DecodeString(txt.Txt[0])
+				raw, err := base64.StdEncoding.DecodeString(txt.Txt[0])
+				if err != nil {
+					return nil, err
+				}
+				return raw, nil
 			}
 		}
 	}
-
-	return nil, fmt.Errorf("no encapsulated data found in DNS message")
+	return nil, fmt.Errorf("DNS数据中未找到封装内容")
 }

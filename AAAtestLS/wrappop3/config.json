@@ -1,5 +1,7 @@
 {
     "pop3_port": ":110",
     "proxy_port": ":8080",
-    "target_addr": "www.baidu.com:80"
+    "target_addr": "www.baidu.com:80",
+    "aes_key": "1234567890abcdef"
+
   }
